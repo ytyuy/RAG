@@ -1,0 +1,19 @@
+# 绝对不提交的内容
+*.env
+app.env
+*.key
+*.pem
+*.p12
+data/
+upload-data/
+local-data/
+output/
+documents/
+
+# 临时文件
+*.tar.gz
+*.zip
+*.bak
+__pycache__/
+*.pyc
+.DS_Store

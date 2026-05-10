@@ -1,0 +1,234 @@
+# ═══════════════════════════════════════════════════════════════
+# 部署说明：只需两个文件，两条命令
+#
+#   rag-rag-mcp-latest.tar  — 镜像包
+#   docker-compose.yml      — 本文件
+#
+#   docker load -i rag-rag-mcp-latest.tar
+#   docker compose up -d
+#
+# 自定义配置（可选）：
+#   将 app.env 放入 ./data/config/app.env
+#   可覆盖 LLM 密钥、检索参数、OCR 配置等所有应用设置
+#   未提供则使用镜像内置默认配置
+#
+# 基础设施密码（postgres / neo4j / minio）：
+#   默认值已内置于本文件，无需额外配置即可运行
+#   如需自定义，直接编辑本文件对应的 ${VAR:-默认值} 部分
+#
+# Neo4j GDS 插件（Graph Data Science）：
+#   首次启动时自动从 graphdatascience.ninja 下载（约 62 MB）
+#   已下载后持久化在 ./data/neo4j-plugins/，后续重启无需重新下载
+#
+# Higress 网关集成（可选）：
+#   部署完成后执行：docker network connect higress rag-mcp
+# ═══════════════════════════════════════════════════════════════
+
+services:
+  etcd:
+    image: quay.io/coreos/etcd:v3.6.10
+    environment:
+      - ETCD_AUTO_COMPACTION_MODE=revision
+      - ETCD_AUTO_COMPACTION_RETENTION=1000
+      - ETCD_QUOTA_BACKEND_BYTES=4294967296
+      - ETCD_SNAPSHOT_COUNT=50000
+    volumes:
+      - ./data/milvus/etcd:/etcd
+    command: >
+      etcd
+      -advertise-client-urls=http://127.0.0.1:2379
+      -listen-client-urls=http://0.0.0.0:2379
+      --data-dir=/etcd
+    healthcheck:
+      test: ["CMD", "etcdctl", "--endpoints=http://127.0.0.1:2379", "endpoint", "health"]
+      interval: 5s
+      start_period: 10s
+      timeout: 5s
+      retries: 3
+    restart: unless-stopped
+
+  minio:
+    image: minio/minio:RELEASE.2025-09-07T16-13-09Z
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ACCESS_KEY:-minioadmin}
+      MINIO_ROOT_PASSWORD: ${MINIO_SECRET_KEY:-Rag-MinIO2026-xK9m}
+    volumes:
+      - ./data/milvus/minio:/minio_data
+    command: minio server /minio_data --console-address ":9001"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 5s
+      start_period: 10s
+      timeout: 5s
+      retries: 3
+    restart: unless-stopped
+
+  milvus-standalone:
+    image: milvusdb/milvus:v2.6.12
+    command: ["milvus", "run", "standalone"]
+    security_opt:
+      - seccomp:unconfined
+    environment:
+      ETCD_ENDPOINTS: etcd:2379
+      MINIO_ADDRESS: minio:9000
+      MINIO_ACCESS_KEY_ID: ${MINIO_ACCESS_KEY:-minioadmin}
+      MINIO_SECRET_ACCESS_KEY: ${MINIO_SECRET_KEY:-Rag-MinIO2026-xK9m}
+    volumes:
+      - ./data/milvus/milvus:/var/lib/milvus
+    configs:
+      - source: milvus_config
+        target: /milvus/configs/user.yaml
+    ports:
+      - "19530:19530"
+      - "9091:9091"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9091/healthz"]
+      interval: 10s
+      start_period: 180s
+      timeout: 10s
+      retries: 5
+    depends_on:
+      etcd:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+    restart: unless-stopped
+
+  neo4j:
+    image: neo4j:5.26.24-community
+    entrypoint:
+      - /bin/bash
+      - -c
+      - |
+        rm -f /var/lib/neo4j/run/neo4j.pid
+        GDS_JAR=/var/lib/neo4j/plugins/graph-data-science.jar
+        GDS_VER=2.13.9
+        if [ ! -f "$$GDS_JAR" ]; then
+          echo "[GDS] 插件未找到，开始下载 v$${GDS_VER}（约 62 MB，首次启动需等待）..."
+          wget -q --show-progress --timeout=600 \
+            -O "$$GDS_JAR" \
+            "https://graphdatascience.ninja/neo4j-graph-data-science-$${GDS_VER}.jar" \
+            || { echo "[GDS] 下载失败，请手动放置 JAR 至 ./data/neo4j-plugins/"; rm -f "$$GDS_JAR"; }
+        fi
+        exec tini -g -- /startup/docker-entrypoint.sh neo4j
+    environment:
+      NEO4J_AUTH: ${NEO4J_AUTH:-neo4j/Rag-Neo4j2026-pQr7}
+      NEO4J_server_memory_heap_max__size: 2G
+      NEO4J_server_memory_pagecache_size: 1G
+      NEO4J_dbms_security_procedures_unrestricted: gds.*
+      NEO4J_dbms_security_procedures_allowlist: gds.*
+    volumes:
+      - ./data/neo4j:/data
+      - ./data/neo4j-plugins:/var/lib/neo4j/plugins
+    ports:
+      - "7474:7474"
+      - "7687:7687"
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:7474 > /dev/null 2>&1 && cypher-shell -u $$(echo $$NEO4J_AUTH | cut -d/ -f1) -p $$(echo $$NEO4J_AUTH | cut -d/ -f2) 'RETURN 1' > /dev/null 2>&1 || exit 1"]
+      interval: 10s
+      start_period: 120s
+      timeout: 10s
+      retries: 10
+    restart: unless-stopped
+
+  postgres:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_DB: rag_monitoring
+      POSTGRES_USER: rag
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-Rag-PG2026-mNv5}
+    volumes:
+      - ./data/postgres:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U rag -d rag_monitoring"]
+      interval: 5s
+      start_period: 30s
+      timeout: 3s
+      retries: 10
+    restart: unless-stopped
+
+  # ─────────────────────────────────────────────────────────────
+  # Redis（供 Higress MCP Session 插件使用）
+  # ─────────────────────────────────────────────────────────────
+  redis:
+    image: redis:7-alpine
+    container_name: rag-redis
+    command: redis-server --save "" --appendonly no
+    restart: unless-stopped
+
+  # ─────────────────────────────────────────────────────────────
+  # RAG MCP Server
+  # ─────────────────────────────────────────────────────────────
+  rag-mcp:
+    container_name: rag-mcp
+    image: rag-rag-mcp:latest
+    environment:
+      - RAG_MILVUS_URI=http://milvus-standalone:19530
+      - NEO4J_URI=bolt://neo4j:7687
+      - NEO4J_AUTH=${NEO4J_AUTH:-neo4j/Rag-Neo4j2026-pQr7}
+      - NEO4J_PASSWORD=${NEO4J_PASSWORD:-Rag-Neo4j2026-pQr7}
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:-Rag-PG2026-mNv5}
+      - MONITORING_PG_DSN=postgresql://rag:${POSTGRES_PASSWORD:-Rag-PG2026-mNv5}@postgres:5432/rag_monitoring
+      - MINIO_ACCESS_KEY=${MINIO_ACCESS_KEY:-minioadmin}
+      - MINIO_SECRET_KEY=${MINIO_SECRET_KEY:-Rag-MinIO2026-xK9m}
+      - DATA_PATH=/app/data
+      - IMAGES_DIR=/app/data/images
+      - SYNC_SOURCE_DIR=/app/documents
+      - UPLOAD_DATA_DIR=/app/upload-data
+      - LOCAL_DATA_DIR=/app/local-data
+      - EXPORT_DIR=/app/output
+      - PADDLE_OCR_STATE_PATH=/app/data/paddle_ocr_usage.json
+      - MCP_TRANSPORT=combined
+      - MCP_PORT=8000
+      - MCP_HOST=0.0.0.0
+      - RESTFUL_API_PORT=8002
+      - MCP_ADMIN_KEY=${MCP_ADMIN_KEY:-Rag-Admin2026-wXy3}
+      - RESTFUL_API_BASE_URL=http://localhost:8002
+      - MCP_PROXY_SECRET=${MCP_PROXY_SECRET:-}
+      - MCP_PROXY_SECRET_HEADER=x-rag-proxy-secret
+      - DEPLOY_MODE=${DEPLOY_MODE:-gateway}
+      - HIGRESS_GATEWAY_URL=${HIGRESS_GATEWAY_URL:-http://higress-ai-gateway:8080}
+      - HIGRESS_CONSOLE_URL=${HIGRESS_CONSOLE_URL:-http://localhost:8001}
+      - HIGRESS_CONSOLE_INTERNAL_URL=${HIGRESS_CONSOLE_INTERNAL_URL:-http://higress-ai-gateway:8001}
+      - HIGRESS_API_KEY=${HIGRESS_API_KEY:-}
+      - HIGRESS_CONSOLE_USER=${HIGRESS_CONSOLE_USER:-}
+      - HIGRESS_CONSOLE_PASSWORD=${HIGRESS_CONSOLE_PASSWORD:-}
+      - HIGRESS_MCP_SERVICE_DOMAIN=${HIGRESS_MCP_SERVICE_DOMAIN:-rag-mcp.mcp}
+      - HIGRESS_MCP_CONSUMERS=${HIGRESS_MCP_CONSUMERS:-[]}
+      - MCP_CONSUMER_HEADER=${MCP_CONSUMER_HEADER:-x-mse-consumer}
+    volumes:
+      - ./data:/app/data
+      - ./upload-data:/app/upload-data
+      - ./local-data:/app/local-data
+      - ./output:/app/output
+      - ${RAG_DOCUMENTS_DIR:-./documents}:/app/documents:ro
+    ports:
+      - "8000:8000"
+      - "8002:8002"
+    command: ["python", "-m", "src.server.mcp_server"]
+    stdin_open: true
+    tty: true
+    restart: unless-stopped
+    depends_on:
+      milvus-standalone:
+        condition: service_healthy
+      neo4j:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+
+configs:
+  milvus_config:
+    content: |
+      # Milvus user configuration overrides
+      common:
+        entityExpiration: -1
+      proxy:
+        maxTaskNum: 1024
+
+volumes: {}
+
+networks:
+  default:
+    external: true
+    name: higress

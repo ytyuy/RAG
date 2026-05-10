@@ -1,0 +1,9 @@
+{
+  "version": "0.2.0",
+  "release_date": "2026-05-10",
+  "min_version": "0.1.0",
+  "download_url": "https://github.com/ytyuy/RAG/releases/download/v0.2.0/rag-src-0.2.0.tar.gz",
+  "checksum_sha256": "a10d8b6a8a63d2156fb976b909bd293ed95285fc26d06e61acdeab9640740f12",
+  "changelog": "- 修复演化引擎 MAB 冷启动选 EMA_ONLY 导致结果永远为空的问题\n- 新增 get_full_documents MCP 工具（按来源全量读取文档）\n- 新增 POST /api/query/feedback REST 接口\n- 修复 Higress MCP Server 同步 405 错误\n- 修复 Higress 图片路由 500 错误\n- 演化引擎 EmergencyTrigger 现在在每次检索后触发\n- 配置白名单补全 21 个缺失变量",
+  "prev_version_url": ""
+}
